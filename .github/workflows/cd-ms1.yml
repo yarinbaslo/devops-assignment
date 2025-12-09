@@ -1,0 +1,120 @@
+name: CD - Microservice 1
+
+on:
+  workflow_run:
+    workflows: ["CI - Microservice 1"]
+    types:
+      - completed
+    branches: [ main ]
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: ms1
+  ECS_CLUSTER: cluster
+  ECS_SERVICE: ms1
+  TASK_FAMILY: ms1
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.workflow_run.head_branch }}
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Retrieve image version
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+        IMAGE_TAG: ${{ github.event.workflow_run.head_sha }}
+      run: |
+        # Retrieve the image that was built in CI
+        IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+        echo "Retrieving image: $IMAGE_URI"
+        echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
+
+    - name: Update ECS Task Definition
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+        TASK_FAMILY: ${{ env.TASK_FAMILY }}
+        IMAGE_TAG: ${{ github.event.workflow_run.head_sha }}
+        AWS_REGION: ${{ env.AWS_REGION }}
+        IMAGE_URI: ${{ env.IMAGE_URI }}
+      run: |
+        # Get current task definition
+        aws ecs describe-task-definition \
+          --task-definition $TASK_FAMILY \
+          --region $AWS_REGION \
+          --query 'taskDefinition' > task-definition.json
+        
+        # Update image using Python
+        python3 << EOF
+        import json
+        import os
+        
+        with open('task-definition.json', 'r') as f:
+            task_def = json.load(f)
+        
+        # Update image with the retrieved image URI
+        new_image = os.environ.get('IMAGE_URI', "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG")
+        task_def['containerDefinitions'][0]['image'] = new_image
+        
+        # Remove fields that can't be set during registration
+        for field in ['taskDefinitionArn', 'revision', 'status', 'requiresAttributes', 'compatibilities', 'registeredAt', 'registeredBy']:
+            task_def.pop(field, None)
+        
+        with open('task-definition-updated.json', 'w') as f:
+            json.dump(task_def, f)
+        EOF
+        
+        # Register new task definition
+        aws ecs register-task-definition \
+          --cli-input-json file://task-definition-updated.json \
+          --region $AWS_REGION
+
+    - name: Update ECS Service
+      env:
+        ECS_CLUSTER: ${{ env.ECS_CLUSTER }}
+        ECS_SERVICE: ${{ env.ECS_SERVICE }}
+        TASK_FAMILY: ${{ env.TASK_FAMILY }}
+        AWS_REGION: ${{ env.AWS_REGION }}
+      run: |
+        # Get the latest task definition revision
+        TASK_DEF_REV=$(aws ecs describe-task-definition \
+          --task-definition $TASK_FAMILY \
+          --region $AWS_REGION \
+          --query 'taskDefinition.revision' \
+          --output text)
+        
+        # Update service with new task definition
+        aws ecs update-service \
+          --cluster $ECS_CLUSTER \
+          --service $ECS_SERVICE \
+          --task-definition $TASK_FAMILY:$TASK_DEF_REV \
+          --region $AWS_REGION
+
+    - name: Wait for service stability
+      env:
+        ECS_CLUSTER: ${{ env.ECS_CLUSTER }}
+        ECS_SERVICE: ${{ env.ECS_SERVICE }}
+        AWS_REGION: ${{ env.AWS_REGION }}
+      run: |
+        aws ecs wait services-stable \
+          --cluster $ECS_CLUSTER \
+          --services $ECS_SERVICE \
+          --region $AWS_REGION
