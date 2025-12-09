@@ -2,7 +2,7 @@ name: CI - Microservice 1
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [ main ]
     paths:
       - 'microservice1/**'
   pull_request:
